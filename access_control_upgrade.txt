@@ -1,0 +1,589 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @title SubscriptionPlatformV2
+ * @dev Enhanced subscription platform with role-based access control
+ */
+contract SubscriptionPlatformV2 is AccessControl, ReentrancyGuard, Pausable {
+    using SubscriptionLib for uint256;
+
+    // ===== ROLES =====
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant CREATOR_MANAGER_ROLE = keccak256("CREATOR_MANAGER_ROLE");
+    bytes32 public constant TREASURY_ROLE = keccak256("TREASURY_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    // ===== CUSTOM ERRORS =====
+    error InvalidCreator();
+    error InvalidTierIndex();
+    error InsufficientPayment();
+    error TokenNotSupported();
+    error TransferFailed();
+    error InvalidAddress();
+    error NoActiveSubscription();
+    error NoSuspendedSubscription();
+    error InvalidDuration();
+    error NoFundsToWithdraw();
+    error ExcessiveFee();
+    error PlanNotActive();
+
+    // ===== STATE VARIABLES =====
+    uint256 public platformFeePercent = 500; // 5% in basis points
+    uint256 public constant MAX_PLATFORM_FEE = 1000; // 10% maximum
+    uint256 public gracePeriod = 7 days;
+    
+    IERC20 public defaultPaymentToken;
+
+    // ===== MAPPINGS =====
+    mapping(address => mapping(address => uint256)) public creatorSubscriptions;
+    mapping(address => bool) public creators;
+    mapping(address => SubscriptionPlan[]) public creatorTiers;
+    mapping(address => CreatorAnalytics) public creatorAnalytics;
+    mapping(address => SubscriptionRecord[]) public subscriptionHistory;
+    mapping(address => mapping(address => bool)) public autoRenewal;
+    mapping(address => bool) public whitelistedTokens;
+    mapping(address => mapping(address => uint256)) public suspendedSubscriptions;
+    mapping(address => uint256) public creatorWithdrawableETH;
+    mapping(address => mapping(address => uint256)) public creatorWithdrawableTokens;
+
+    // ===== STRUCTS =====
+    struct SubscriptionPlan {
+        uint256 fee;
+        uint256 tokenFee;
+        uint256 duration;
+        string metadata;
+        string benefits;
+        bool active;
+        uint256 maxSubscribers; // 0 = unlimited
+        uint256 currentSubscribers;
+    }
+
+    struct SubscriptionRecord {
+        address user;
+        address creator;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 amountPaid;
+        string paymentMethod;
+    }
+
+    struct CreatorAnalytics {
+        uint128 totalEarningsETH;
+        uint128 totalEarningsTokens;
+        uint64 activeSubscribers;
+        uint64 totalSubscribers;
+        uint64 lifetimeSubscribers;
+        uint32 averageSubscriptionDuration;
+    }
+
+    // ===== EVENTS =====
+    event Subscribed(address indexed user, address indexed creator, uint256 expiry);
+    event SubscribedWithToken(address indexed user, address indexed creator, uint256 expiry);
+    event AutoRenewalEnabled(address indexed creator, address indexed user);
+    event AutoRenewalDisabled(address indexed creator, address indexed user);
+    event SubscriptionSuspended(address indexed user, address indexed creator, uint256 expiry);
+    event SubscriptionReactivated(address indexed user, address indexed creator, uint256 expiry);
+    event CreatorAdded(address indexed creator, address indexed addedBy);
+    event CreatorRemoved(address indexed creator, address indexed removedBy);
+    event PlanUpdated(
+        address indexed creator,
+        uint256 indexed tierIndex,
+        uint256 fee,
+        uint256 tokenFee,
+        uint256 duration,
+        string metadata,
+        string benefits
+    );
+    event PlatformFeeUpdated(uint256 oldFee, uint256 newFee);
+    event TokenWhitelisted(address indexed token);
+    event TokenRemovedFromWhitelist(address indexed token);
+    event CreatorWithdrawal(address indexed creator, uint256 ethAmount, address token, uint256 tokenAmount);
+    event PlatformWithdrawal(address indexed treasury, uint256 ethAmount, address token, uint256 tokenAmount);
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender) override;
+
+    // ===== MODIFIERS =====
+    modifier validAddress(address _addr) {
+        if (_addr == address(0)) revert InvalidAddress();
+        _;
+    }
+
+    modifier onlyCreator() {
+        if (!creators[msg.sender]) revert InvalidCreator();
+        _;
+    }
+
+    // ===== CONSTRUCTOR =====
+    constructor(
+        address _defaultTokenAddress,
+        address _admin,
+        address _treasury
+    ) validAddress(_defaultTokenAddress) validAddress(_admin) validAddress(_treasury) {
+        // Grant roles
+        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
+        _grantRole(ADMIN_ROLE, _admin);
+        _grantRole(TREASURY_ROLE, _treasury);
+        _grantRole(CREATOR_MANAGER_ROLE, _admin);
+        _grantRole(OPERATOR_ROLE, _admin);
+
+        defaultPaymentToken = IERC20(_defaultTokenAddress);
+        creators[_admin] = true;
+        whitelistedTokens[_defaultTokenAddress] = true;
+
+        emit CreatorAdded(_admin, address(this));
+        emit TokenWhitelisted(_defaultTokenAddress);
+    }
+
+    // ===== SUBSCRIPTION FUNCTIONS =====
+    function subscribe(address creator, uint256 tierIndex)
+        external
+        payable
+        whenNotPaused
+        validAddress(creator)
+        nonReentrant
+    {
+        if (!creators[creator]) revert InvalidCreator();
+        if (tierIndex >= creatorTiers[creator].length) revert InvalidTierIndex();
+
+        SubscriptionPlan storage plan = creatorTiers[creator][tierIndex];
+        if (!plan.active) revert PlanNotActive();
+        if (plan.duration == 0) revert InvalidDuration();
+        if (msg.value < plan.fee) revert InsufficientPayment();
+
+        // Check subscriber limit
+        if (plan.maxSubscribers > 0 && plan.currentSubscribers >= plan.maxSubscribers) {
+            revert("Subscriber limit reached");
+        }
+
+        _processSubscription(creator, tierIndex, plan.duration, msg.value, 0, "ETH");
+
+        // Refund excess payment
+        if (msg.value > plan.fee) {
+            (bool success, ) = msg.sender.call{value: msg.value - plan.fee}("");
+            if (!success) revert TransferFailed();
+        }
+
+        emit Subscribed(msg.sender, creator, creatorSubscriptions[creator][msg.sender]);
+    }
+
+    function subscribeWithToken(
+        address creator,
+        uint256 tierIndex,
+        address token,
+        uint256 amount
+    ) external whenNotPaused validAddress(creator) validAddress(token) nonReentrant {
+        if (!creators[creator]) revert InvalidCreator();
+        if (tierIndex >= creatorTiers[creator].length) revert InvalidTierIndex();
+        if (!whitelistedTokens[token]) revert TokenNotSupported();
+
+        SubscriptionPlan storage plan = creatorTiers[creator][tierIndex];
+        if (!plan.active) revert PlanNotActive();
+        if (plan.duration == 0) revert InvalidDuration();
+        if (amount < plan.tokenFee) revert InsufficientPayment();
+
+        // Check subscriber limit
+        if (plan.maxSubscribers > 0 && plan.currentSubscribers >= plan.maxSubscribers) {
+            revert("Subscriber limit reached");
+        }
+
+        IERC20 paymentToken = IERC20(token);
+        if (!paymentToken.transferFrom(msg.sender, address(this), plan.tokenFee)) {
+            revert TransferFailed();
+        }
+
+        _processSubscription(creator, tierIndex, plan.duration, 0, plan.tokenFee, "Token");
+
+        emit SubscribedWithToken(msg.sender, creator, creatorSubscriptions[creator][msg.sender]);
+    }
+
+    function _processSubscription(
+        address creator,
+        uint256 tierIndex,
+        uint256 duration,
+        uint256 ethPaid,
+        uint256 tokensPaid,
+        string memory paymentMethod
+    ) internal {
+        bool wasExpired = creatorSubscriptions[creator][msg.sender] <= block.timestamp;
+        bool isNewSubscriber = creatorSubscriptions[creator][msg.sender] == 0;
+
+        // Calculate fees
+        uint256 platformFeeETH = 0;
+        uint256 platformFeeTokens = 0;
+        uint256 creatorEarningsETH = ethPaid;
+        uint256 creatorEarningsTokens = tokensPaid;
+
+        if (ethPaid > 0) {
+            platformFeeETH = (ethPaid * platformFeePercent) / 10000;
+            creatorEarningsETH = ethPaid - platformFeeETH;
+        }
+
+        if (tokensPaid > 0) {
+            platformFeeTokens = (tokensPaid * platformFeePercent) / 10000;
+            creatorEarningsTokens = tokensPaid - platformFeeTokens;
+        }
+
+        // Calculate new expiry
+        uint256 newExpiry = SubscriptionLib.calculateNewExpiry(
+            creatorSubscriptions[creator][msg.sender],
+            duration
+        );
+
+        creatorSubscriptions[creator][msg.sender] = newExpiry;
+
+        // Update tier subscriber count
+        if (isNewSubscriber) {
+            creatorTiers[creator][tierIndex].currentSubscribers++;
+        }
+
+        // Update analytics
+        CreatorAnalytics storage analytics = creatorAnalytics[creator];
+        
+        if (isNewSubscriber) {
+            analytics.totalSubscribers++;
+            analytics.lifetimeSubscribers++;
+        }
+        if (wasExpired) {
+            analytics.activeSubscribers++;
+        }
+
+        // Update earnings
+        if (creatorEarningsETH > 0) {
+            analytics.totalEarningsETH += uint128(creatorEarningsETH);
+            creatorWithdrawableETH[creator] += creatorEarningsETH;
+        }
+        if (creatorEarningsTokens > 0) {
+            analytics.totalEarningsTokens += uint128(creatorEarningsTokens);
+            // For tokens, we need to track per token type
+        }
+
+        // Record subscription history
+        subscriptionHistory[msg.sender].push(
+            SubscriptionRecord({
+                user: msg.sender,
+                creator: creator,
+                startTime: block.timestamp,
+                endTime: newExpiry,
+                amountPaid: ethPaid > 0 ? ethPaid : tokensPaid,
+                paymentMethod: paymentMethod
+            })
+        );
+    }
+
+    // ===== AUTO RENEWAL =====
+    function enableAutoRenewal(address creator) external validAddress(creator) {
+        autoRenewal[creator][msg.sender] = true;
+        emit AutoRenewalEnabled(creator, msg.sender);
+    }
+
+    function disableAutoRenewal(address creator) external validAddress(creator) {
+        autoRenewal[creator][msg.sender] = false;
+        emit AutoRenewalDisabled(creator, msg.sender);
+    }
+
+    function batchProcessAutoRenewals(
+        address[] calldata creators,
+        address[] calldata users,
+        uint256[] calldata tierIndexes
+    ) external onlyRole(OPERATOR_ROLE) {
+        require(creators.length == users.length && users.length == tierIndexes.length, "Array length mismatch");
+
+        for (uint256 i = 0; i < creators.length; i++) {
+            if (autoRenewal[creators[i]][users[i]] &&
+                creatorSubscriptions[creators[i]][users[i]] <= block.timestamp + gracePeriod) {
+                // Process auto-renewal logic here
+                // This would typically involve pre-authorized payments
+                _processAutoRenewal(creators[i], users[i], tierIndexes[i]);
+            }
+        }
+    }
+
+    function _processAutoRenewal(address creator, address user, uint256 tierIndex) internal {
+        // Implementation for auto-renewal
+        // This is a placeholder - would need integration with payment authorization system
+    }
+
+    // ===== SUSPENSION MANAGEMENT =====
+    function suspendSubscription(address creator) external validAddress(creator) {
+        if (creatorSubscriptions[creator][msg.sender] <= block.timestamp) {
+            revert NoActiveSubscription();
+        }
+
+        suspendedSubscriptions[creator][msg.sender] = creatorSubscriptions[creator][msg.sender];
+        creatorSubscriptions[creator][msg.sender] = 0;
+
+        if (creatorAnalytics[creator].activeSubscribers > 0) {
+            creatorAnalytics[creator].activeSubscribers--;
+        }
+
+        emit SubscriptionSuspended(msg.sender, creator, suspendedSubscriptions[creator][msg.sender]);
+    }
+
+    function reactivateSubscription(address creator) external validAddress(creator) {
+        if (suspendedSubscriptions[creator][msg.sender] == 0) {
+            revert NoSuspendedSubscription();
+        }
+
+        creatorSubscriptions[creator][msg.sender] = suspendedSubscriptions[creator][msg.sender];
+        suspendedSubscriptions[creator][msg.sender] = 0;
+
+        if (creatorSubscriptions[creator][msg.sender] > block.timestamp) {
+            creatorAnalytics[creator].activeSubscribers++;
+        }
+
+        emit SubscriptionReactivated(msg.sender, creator, creatorSubscriptions[creator][msg.sender]);
+    }
+
+    // ===== CREATOR MANAGEMENT =====
+    function addCreator(address creator) external onlyRole(CREATOR_MANAGER_ROLE) validAddress(creator) {
+        creators[creator] = true;
+        emit CreatorAdded(creator, msg.sender);
+    }
+
+    function removeCreator(address creator) external onlyRole(CREATOR_MANAGER_ROLE) validAddress(creator) {
+        creators[creator] = false;
+        delete creatorTiers[creator];
+        delete creatorAnalytics[creator];
+        emit CreatorRemoved(creator, msg.sender);
+    }
+
+    function updateCreatorPlan(
+        uint256 tierIndex,
+        uint256 fee,
+        uint256 tokenFee,
+        uint256 duration,
+        string calldata metadata,
+        string calldata benefits,
+        bool active,
+        uint256 maxSubscribers
+    ) external onlyCreator {
+        if (duration == 0) revert InvalidDuration();
+
+        SubscriptionPlan memory newPlan = SubscriptionPlan({
+            fee: fee,
+            tokenFee: tokenFee,
+            duration: duration,
+            metadata: metadata,
+            benefits: benefits,
+            active: active,
+            maxSubscribers: maxSubscribers,
+            currentSubscribers: 0
+        });
+
+        if (tierIndex < creatorTiers[msg.sender].length) {
+            // Preserve current subscriber count when updating
+            newPlan.currentSubscribers = creatorTiers[msg.sender][tierIndex].currentSubscribers;
+            creatorTiers[msg.sender][tierIndex] = newPlan;
+        } else {
+            creatorTiers[msg.sender].push(newPlan);
+        }
+
+        emit PlanUpdated(msg.sender, tierIndex, fee, tokenFee, duration, metadata, benefits);
+    }
+
+    function togglePlanStatus(uint256 tierIndex) external onlyCreator {
+        if (tierIndex >= creatorTiers[msg.sender].length) revert InvalidTierIndex();
+        creatorTiers[msg.sender][tierIndex].active = !creatorTiers[msg.sender][tierIndex].active;
+    }
+
+    // ===== PLATFORM ADMINISTRATION =====
+    function addWhitelistedToken(address token) external onlyRole(ADMIN_ROLE) validAddress(token) {
+        whitelistedTokens[token] = true;
+        emit TokenWhitelisted(token);
+    }
+
+    function removeWhitelistedToken(address token) external onlyRole(ADMIN_ROLE) validAddress(token) {
+        whitelistedTokens[token] = false;
+        emit TokenRemovedFromWhitelist(token);
+    }
+
+    function updatePlatformFee(uint256 newFeePercent) external onlyRole(ADMIN_ROLE) {
+        if (newFeePercent > MAX_PLATFORM_FEE) revert ExcessiveFee();
+        uint256 oldFee = platformFeePercent;
+        platformFeePercent = newFeePercent;
+        emit PlatformFeeUpdated(oldFee, newFeePercent);
+    }
+
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
+
+    // ===== WITHDRAWAL FUNCTIONS =====
+    function creatorWithdrawETH() external onlyCreator nonReentrant {
+        uint256 amount = creatorWithdrawableETH[msg.sender];
+        if (amount == 0) revert NoFundsToWithdraw();
+
+        creatorWithdrawableETH[msg.sender] = 0;
+        
+        (bool success, ) = msg.sender.call{value: amount}("");
+        if (!success) revert TransferFailed();
+
+        emit CreatorWithdrawal(msg.sender, amount, address(0), 0);
+    }
+
+    function creatorWithdrawTokens(address token) external onlyCreator nonReentrant validAddress(token) {
+        uint256 amount = creatorWithdrawableTokens[msg.sender][token];
+        if (amount == 0) revert NoFundsToWithdraw();
+
+        creatorWithdrawableTokens[msg.sender][token] = 0;
+        
+        IERC20(token).transfer(msg.sender, amount);
+
+        emit CreatorWithdrawal(msg.sender, 0, token, amount);
+    }
+
+    function platformWithdrawETH(uint256 amount, address treasury) 
+        external 
+        onlyRole(TREASURY_ROLE) 
+        validAddress(treasury) 
+        nonReentrant 
+    {
+        if (amount > address(this).balance) revert NoFundsToWithdraw();
+
+        (bool success, ) = treasury.call{value: amount}("");
+        if (!success) revert TransferFailed();
+
+        emit PlatformWithdrawal(treasury, amount, address(0), 0);
+    }
+
+    function platformWithdrawTokens(address token, uint256 amount, address treasury)
+        external
+        onlyRole(TREASURY_ROLE)
+        validAddress(token)
+        validAddress(treasury)
+        nonReentrant
+    {
+        IERC20 tokenContract = IERC20(token);
+        if (amount > tokenContract.balanceOf(address(this))) revert NoFundsToWithdraw();
+        
+        if (!tokenContract.transfer(treasury, amount)) revert TransferFailed();
+
+        emit PlatformWithdrawal(treasury, 0, token, amount);
+    }
+
+    function emergencyWithdraw(address token, address to) 
+        external 
+        onlyRole(DEFAULT_ADMIN_ROLE) 
+        validAddress(to) 
+    {
+        if (token == address(0)) {
+            (bool success, ) = to.call{value: address(this).balance}("");
+            if (!success) revert TransferFailed();
+        } else {
+            IERC20 tokenContract = IERC20(token);
+            tokenContract.transfer(to, tokenContract.balanceOf(address(this)));
+        }
+    }
+
+    // ===== VIEW FUNCTIONS =====
+    function isSubscriptionActive(address creator, address user) external view returns (bool) {
+        return creatorSubscriptions[creator][user] > block.timestamp;
+    }
+
+    function getSubscriptionExpiry(address creator, address user) external view returns (uint256) {
+        return creatorSubscriptions[creator][user];
+    }
+
+    function getCreatorTiersCount(address creator) external view returns (uint256) {
+        return creatorTiers[creator].length;
+    }
+
+    function getCreatorTier(address creator, uint256 tierIndex) external view returns (SubscriptionPlan memory) {
+        if (tierIndex >= creatorTiers[creator].length) revert InvalidTierIndex();
+        return creatorTiers[creator][tierIndex];
+    }
+
+    function getSubscriptionHistory(address user) external view returns (SubscriptionRecord[] memory) {
+        return subscriptionHistory[user];
+    }
+
+    function getCreatorAnalytics(address creator) external view returns (CreatorAnalytics memory) {
+        return creatorAnalytics[creator];
+    }
+
+    function getCreatorWithdrawableETH(address creator) external view returns (uint256) {
+        return creatorWithdrawableETH[creator];
+    }
+
+    function getCreatorWithdrawableTokens(address creator, address token) external view returns (uint256) {
+        return creatorWithdrawableTokens[creator][token];
+    }
+
+    // ===== BATCH OPERATIONS =====
+    function batchSubscribe(
+        address[] calldata creators,
+        uint256[] calldata tierIndexes
+    ) external payable whenNotPaused nonReentrant {
+        require(creators.length == tierIndexes.length, "Array length mismatch");
+        
+        uint256 totalRequired = 0;
+        for (uint256 i = 0; i < creators.length; i++) {
+            SubscriptionPlan memory plan = creatorTiers[creators[i]][tierIndexes[i]];
+            totalRequired += plan.fee;
+        }
+        
+        require(msg.value >= totalRequired, "Insufficient ETH sent");
+        
+        for (uint256 i = 0; i < creators.length; i++) {
+            // Process individual subscriptions
+            SubscriptionPlan memory plan = creatorTiers[creators[i]][tierIndexes[i]];
+            _processSubscription(creators[i], tierIndexes[i], plan.duration, plan.fee, 0, "ETH");
+        }
+        
+        // Refund excess
+        if (msg.value > totalRequired) {
+            (bool success, ) = msg.sender.call{value: msg.value - totalRequired}("");
+            if (!success) revert TransferFailed();
+        }
+    }
+
+    // ===== FALLBACK =====
+    receive() external payable {
+        // Allow contract to receive ETH
+    }
+}
+
+// ===== SUBSCRIPTION LIBRARY =====
+library SubscriptionLib {
+    function calculateNewExpiry(uint256 currentExpiry, uint256 duration)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 baseTime = currentExpiry > block.timestamp ? currentExpiry : block.timestamp;
+        return baseTime + duration;
+    }
+
+    function isExpired(uint256 expiry) internal view returns (bool) {
+        return expiry <= block.timestamp;
+    }
+
+    function timeUntilExpiry(uint256 expiry) internal view returns (uint256) {
+        if (expiry <= block.timestamp) return 0;
+        return expiry - block.timestamp;
+    }
+
+    function calculateProRatedRefund(
+        uint256 amountPaid,
+        uint256 subscriptionStart,
+        uint256 subscriptionEnd,
+        uint256 cancelTime
+    ) internal pure returns (uint256) {
+        if (cancelTime <= subscriptionStart) return amountPaid;
+        if (cancelTime >= subscriptionEnd) return 0;
+        
+        uint256 totalDuration = subscriptionEnd - subscriptionStart;
+        uint256 remainingDuration = subscriptionEnd - cancelTime;
+        
+        return (amountPaid * remainingDuration) / totalDuration;
+    }
+}
