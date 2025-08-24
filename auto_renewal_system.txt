@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+
+/**
+ * @title AutoRenewalManager
+ * @dev Manages automatic subscription renewals with pre-authorized payments
+ */
+contract AutoRenewalManager is ReentrancyGuard, EIP712 {
+    using ECDSA for bytes32;
+
+    // ===== CUSTOM ERRORS =====
+    error InvalidSignature();
+    error AuthorizationExpired();
+    error InsufficientAllowance();
+    error PaymentFailed();
+    error UnauthorizedRenewal();
+
+    // ===== STATE VARIABLES =====
+    address public subscriptionPlatform;
+    uint256 public constant AUTHORIZATION_VALIDITY = 30 days;
+    
+    mapping(address => mapping(address => PaymentAuthorization)) public paymentAuthorizations;
+    mapping(bytes32 => bool) public usedNonces;
+
+    // ===== STRUCTS =====
+    struct PaymentAuthorization {
+        uint256 maxAmount;           // Maximum amount authorized per renewal
+        uint256 maxTotalAmount;      // Maximum total amount for all renewals
+        uint256 totalSpent;          // Total amount already spent
+        uint256 expiry;              // Authorization expiry timestamp
+        bool isActive;               // Authorization status
+        address paymentToken;        // Token to use for payment (address(0) for ETH)
+    }
+
+    struct RenewalRequest {
+        address user;
+        address creator;
+        uint256 tierIndex;
+        uint256 amount;
+        address paymentToken;
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    // ===== EVENTS =====
+    event PaymentAuthorized(
+        address indexed user,
+        address indexed creator,
+        uint256 maxAmount,
+        uint256 maxTotalAmount,
+        address paymentToken,
+        uint256 expiry
+    );
+    event PaymentAuthorizationRevoked(address indexed user, address indexed creator);
+    event AutoRenewalProcessed(
+        address indexed user,
+        address indexed creator,
+        uint256 amount,
+        address paymentToken
+    );
+    event AuthorizationUpdated(
+        address indexed user,
+        address indexed creator,
+        uint256 newMaxAmount,
+        uint256 newMaxTotalAmount
+    );
+
+    // ===== CONSTRUCTOR =====
+    constructor(address _subscriptionPlatform) EIP712("AutoRenewalManager", "1") {
+        subscriptionPlatform = _subscriptionPlatform;
+    }
+
+    // ===== PAYMENT AUTHORIZATION =====
+    function authorizePayment(
+        address creator,
+        uint256 maxAmount,
+        uint256 maxTotalAmount,
+        address paymentToken,
+        uint256 validityPeriod
+    ) external {
+        require(maxAmount > 0, "Max amount must be positive");
+        require(maxTotalAmount >= maxAmount, "Total amount must be >= max amount");
+        require(validityPeriod <= AUTHORIZATION_VALIDITY, "Validity period too long");
+
+        uint256 expiry = block.timestamp + validityPeriod;
+
+        paymentAuthorizations[msg.sender][creator] = PaymentAuthorization({
+            maxAmount: maxAmount,
+            maxTotalAmount: maxTotalAmount,
+            totalSpent: 0,
+            expiry: expiry,
+            isActive: true,
+            paymentToken: paymentToken
+        });
+
+        emit PaymentAuthorized(msg.sender, creator, maxAmount, maxTotalAmount, paymentToken, expiry);
+    }
+
+    function revokePaymentAuthorization(address creator) external {
+        paymentAuthorizations[msg.sender][creator].isActive = false;
+        emit PaymentAuthorizationRevoked(msg.sender, creator);
+    }
+
+    function updatePaymentAuthorization(
+        address creator,
+        uint256 newMaxAmount,
+        uint256 newMaxTotalAmount
+    ) external {
+        PaymentAuthorization storage auth = paymentAuthorizations[msg.sender][creator];
+        require(auth.isActive, "Authorization not active");
+        require(block.timestamp < auth.expiry, "Authorization expired");
+        require(newMaxAmount > 0, "Max amount must be positive");
+        require(newMaxTotalAmount >= newMaxAmount, "Total amount must be >= max amount");
+
+        auth.maxAmount = newMaxAmount;
+        auth.maxTotalAmount = newMaxTotalAmount;
+
+        emit AuthorizationUpdated(msg.sender, creator, newMaxAmount, newMaxTotalAmount);
+    }
+
+    // ===== AUTO RENEWAL PROCESSING =====
+    function processAutoRenewal(
+        address user,
+        address creator,
+        uint256 tierIndex,
+        uint256 amount,
+        address paymentToken
+    ) external nonReentrant {
+        require(msg.sender == subscriptionPlatform, "Only subscription platform can process renewals");
+
+        PaymentAuthorization storage auth = paymentAuthorizations[user][creator];
+        
+        // Validate authorization
+        require(auth.isActive, "Payment authorization not active");
+        require(block.timestamp < auth.expiry, "Payment authorization expired");
+        require(auth.paymentToken == paymentToken, "Payment token mismatch");
+        require(amount <= auth.maxAmount, "Amount exceeds authorized limit");
+        require(auth.totalSpent + amount <= auth.maxTotalAmount, "Total spent would exceed limit");
+
+        // Process payment
+        if (paymentToken == address(0)) {
+            // ETH payment - user must have sent ETH to this contract
+            require(address(this).balance >= amount, "Insufficient ETH balance");
+        } else {
+            // Token payment
+            IERC20 token = IERC20(paymentToken);
+            require(token.allowance(user, address(this)) >= amount, "Insufficient token allowance");
+            require(token.transferFrom(user, subscriptionPlatform, amount), "Token transfer failed");
+        }
+
+        // Update spent amount
+        auth.totalSpent += amount;
+
+        // Call subscription platform to process the renewal
+        _processRenewalOnPlatform(user, creator, tierIndex, amount, paymentToken);
+
+        emit AutoRenewalProcessed(user, creator, amount, paymentToken);
+    }
+
+    function _processRenewalOnPlatform(
+        address user,
+        address creator,
+        uint256 tierIndex,
+        uint256 amount,
+        address paymentToken
+    ) internal {
+        // This would call the subscription platform's renewal function
+        // Implementation depends on the platform's interface
+        if (paymentToken == address(0)) {
+            // ETH renewal
+            (bool success, ) = subscriptionPlatform.call{value: amount}(
+                abi.encodeWithSignature("processRenewalETH(address,address,uint256)", user, creator, tierIndex)
+            );
+            require(success, "Platform renewal failed");
+        } else {
+            // Token renewal
+            (bool success, ) = subscriptionPlatform.call(
+                abi.encodeWithSignature(
+                    "processRenewalToken(address,address,uint256,address,uint256)",
+                    user,
+                    creator,
+                    tierIndex,
+                    paymentToken,
+                    amount
+                )
+            );
+            require(success, "Platform renewal failed");
+        }
+    }
+
+    // ===== SIGNATURE-BASED RENEWALS =====
+    function processRenewalWithSignature(
+        RenewalRequest calldata request,
+        bytes calldata signature
+    ) external nonReentrant {
+        // Verify deadline
+        require(block.timestamp <= request.deadline, "Request expired");
+        
+        // Verify nonce
+        bytes32 requestHash = _hashRenewalRequest(request);
+        require(!usedNonces[requestHash], "Nonce already used");
+        usedNonces[requestHash] = true;
+
+        // Verify signature
+        bytes32 digest = _hashTypedDataV4(requestHash);
+        address signer = digest.recover(signature);
+        require(signer == request.user, "Invalid signature");
+
+        // Process the renewal
+        processAutoRenewal(
+            request.user,
+            request.creator,
+            request.tierIndex,
+            request.amount,
+            request.paymentToken
+        );
+    }
+
+    function _hashRenewalRequest(RenewalRequest calldata request) internal pure returns (bytes32) {
+        return keccak256(abi.encode(
+            keccak256("RenewalRequest(address user,address creator,uint256 tierIndex,uint256 amount,address paymentToken,uint256 nonce,uint256 deadline)"),
+            request.user,
+            request.creator,
+            request.tierIndex,
+            request.amount,
+            request.paymentToken,
+            request.nonce,
+            request.deadline
+        ));
+    }
+
+    // ===== BATCH RENEWAL PROCESSING =====
+    function batchProcessRenewals(
+        address[] calldata users,
+        address[] calldata creators,
+        uint256[] calldata tierIndexes,
+        uint256[] calldata amounts,
+        address[] calldata paymentTokens
+    ) external nonReentrant {
+        require(msg.sender == subscriptionPlatform, "Only subscription platform can process renewals");
+        require(
+            users.length == creators.length &&
+            creators.length == tierIndexes.length &&
+            tierIndexes.length == amounts.length &&
+            amounts.length == paymentTokens.length,
+            "Array length mismatch"
+        );
+
+        for (uint256 i = 0; i < users.length; i++) {
+            try this.processAutoRenewal(users[i], creators[i], tierIndexes[i], amounts[i], paymentTokens[i]) {
+                // Renewal successful
+            } catch Error(string memory reason) {
+                // Skip failed renewals and continue with the next one
+                emit RenewalFailed(users[i], creators[i], reason);
+            } catch {
+                emit RenewalFailed(users[i], creators[i], "Unknown error");
+            }
+        }
+    }
+
+    // ===== VIEW FUNCTIONS =====
+    function getPaymentAuthorization(address user, address creator) 
+        external 
+        view 
+        returns (PaymentAuthorization memory) 
+    {
+        return paymentAuthorizations[user][creator];
+    }
+
+    function isAuthorizationValid(address user, address creator) external view returns (bool) {
+        PaymentAuthorization memory auth = paymentAuthorizations[user][creator];
+        return auth.isActive && block.timestamp < auth.expiry;
+    }
+
+    function getRemainingAuthorizedAmount(address user, address creator) external view returns (uint256) {
+        PaymentAuthorization memory auth = paymentAuthorizations[user][creator];
+        if (!auth.isActive || block.timestamp >= auth.expiry) return 0;
+        return auth.maxTotalAmount - auth.totalSpent;
+    }
+
+    // ===== EMERGENCY FUNCTIONS =====
+    function emergencyPause() external {
+        require(msg.sender == subscriptionPlatform, "Only platform can pause");
+        // Implementation for emergency pause
+    }
+
+    function withdrawStuckFunds(address token, uint256 amount) external {
+        require(msg.sender == subscriptionPlatform, "Only platform can withdraw");
+        
+        if (token == address(0)) {
+            payable(subscriptionPlatform).transfer(amount);
+        } else {
+            IERC20(token).transfer(subscriptionPlatform, amount);
+        }
+    }
+
+    // ===== EVENTS =====
+    event RenewalFailed(address indexed user, address indexed creator, string reason);
+
+    // ===== RECEIVE FUNCTION =====
+    receive() external payable {
+        // Allow contract to receive ETH for renewals
+    }
+}
+
+// ===== CHAINLINK AUTOMATION INTEGRATION =====
+contract SubscriptionAutomationUpkeep {
+    address public subscriptionPlatform;
+    address public autoRenewalManager;
+    uint256 public checkInterval = 1 hours;
+    uint256 public lastCheckTime;
+    
+    struct PendingRenewal {
+        address user;
+        address creator;
+        uint256 tierIndex;
+        uint256 expiryTime;
+        bool processed;
+    }
+    
+    PendingRenewal[] public pendingRenewals;
+    
+    constructor(address _platform, address _renewalManager) {
+        subscriptionPlatform = _platform;
+        autoRenewalManager = _renewalManager;
+        lastCheckTime = block.timestamp;
+    }
+    
+    function checkUpkeep(bytes calldata)
+        external
+        view
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        upkeepNeeded = (block.timestamp - lastCheckTime) > checkInterval;
+        
+        if (upkeepNeeded) {
+            // Find subscriptions that need renewal
+            address[] memory users = new address[](10); // Batch size
+            address[] memory creators = new address[](10);
+            uint256[] memory tierIndexes = new uint256[](10);
+            uint256 count = 0;
+            
+            // Logic to populate arrays with subscriptions needing renewal
+            // This would typically query the subscription platform
+            
+            performData = abi.encode(users, creators, tierIndexes, count);
+        }
+    }
+    
+    function performUpkeep(bytes calldata performData) external {
+        (address[] memory users, address[] memory creators, uint256[] memory tierIndexes, uint256 count) 
+            = abi.decode(performData, (address[], address[], uint256[], uint256));
+        
+        // Process renewals
+        for (uint256 i = 0; i < count; i++) {
+            // Call auto renewal manager
+            // AutoRenewalManager(autoRenewalManager).processAutoRenewal(...)
+        }
+        
+        lastCheckTime = block.timestamp;
+    }
+}
