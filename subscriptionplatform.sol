@@ -236,7 +236,7 @@ contract SubscriptionPlatform is ReentrancyGuard {
         }
         if (wasExpired) {
             creatorAnalytics[creator].activeSubscribers++;
-        }}
+        }
 
         // Update earnings
         if (ethPaid > 0) {
