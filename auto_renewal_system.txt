@@ -232,7 +232,7 @@ contract AutoRenewalManager is ReentrancyGuard, EIP712 {
             request.nonce,
             request.deadline
         ));
-    }
+    }}
 
     // ===== BATCH RENEWAL PROCESSING =====
     function batchProcessRenewals(
