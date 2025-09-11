@@ -7,6 +7,20 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 // Custom errors for gas optimization
+error NotOwneFixed SubscriptionPlatform Contract
+
+I've implemented all the recommended fixes to address the vulnerabilities and improve the contract's functionality. Here's the cleaned-up code:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+
+// Custom errors for gas optimization
 error NotOwner();
 error NotCreator();
 error ContractPaused();
@@ -26,15 +40,18 @@ error InvalidStringLength();
 error ArrayLengthMismatch();
 error TierLimitExceeded();
 error PlanNotActive();
+error InsufficientAllowance();
+error PendingOwnerOnly();
 
-contract SubscriptionPlatform is ReentrancyGuard {
+contract SubscriptionPlatform is ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
     
-    address public owner;
+    address public pendingOwnerOverride;
     uint256 public platformFeePercent = 500; // 5% in basis points (500/10000)
     uint256 public gracePeriod = 7 days;
     uint256 public constant MAX_TIERS = 10;
     uint256 public constant MAX_FEE_PERCENT = 1000; // 10%
+    uint256 public constant MAX_HISTORY_RECORDS = 100; // Limit subscription history
     bool public paused = false;
 
     IERC20 public defaultPaymentToken;
@@ -49,6 +66,10 @@ contract SubscriptionPlatform is ReentrancyGuard {
     mapping(address => bool) public whitelistedTokens;
     mapping(address => mapping(address => uint256)) public suspendedSubscriptions;
     mapping(address => mapping(address => uint256)) public userTierIndex; // user -> creator -> tier index
+    mapping(address => address[]) public userActiveSubscriptions; // user -> list of creators
+
+    // Arrays for iterable access
+    address[] public allWhitelistedTokens;
 
     // Structs
     struct SubscriptionPlan {
@@ -67,14 +88,14 @@ contract SubscriptionPlatform is ReentrancyGuard {
         uint256 startTime;
         uint256 endTime;
         uint256 amountPaid;
-        string paymentMethod;
+        address paymentToken;  // address(0) for ETH
     }
 
     struct CreatorAnalytics {
         uint128 totalEarningsETH;
         uint128 totalEarningsTokens;
-        uint32 activeSubscribers;
         uint32 totalSubscribers;
+        // Active subscribers calculated on-demand to ensure accuracy
     }
 
     // Events
@@ -105,10 +126,11 @@ contract SubscriptionPlatform is ReentrancyGuard {
     event ETHWithdrawn(address indexed to, uint256 amount);
     event TokensWithdrawn(address indexed token, address indexed to, uint256 amount);
     event FeesDistributed(address indexed creator, uint256 creatorShare, uint256 platformFee);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
 
     // Modifiers
     modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
+        if (msg.sender != owner()) revert NotOwner();
         _;
     }
 
@@ -133,11 +155,19 @@ contract SubscriptionPlatform is ReentrancyGuard {
         _;
     }
 
+    modifier hasSufficientAllowance(address token, uint256 amount) {
+        if (token != address(0) && IERC20(token).allowance(msg.sender, address(this)) < amount) {
+            revert InsufficientAllowance();
+        }
+        _;
+    }
+
     constructor(address _defaultTokenAddress) validAddress(_defaultTokenAddress) {
-        owner = msg.sender;
+        _transferOwnership(msg.sender);
         defaultPaymentToken = IERC20(_defaultTokenAddress);
         creators[msg.sender] = true;
         whitelistedTokens[_defaultTokenAddress] = true;
+        allWhitelistedTokens.push(_defaultTokenAddress);
         
         emit CreatorAdded(msg.sender);
         emit TokenWhitelisted(_defaultTokenAddress);
@@ -165,7 +195,7 @@ contract SubscriptionPlatform is ReentrancyGuard {
         (uint256 creatorShare, uint256 platformFee) = _calculateFees(plan.fee);
         _distributeETHFees(creator, creatorShare, platformFee);
 
-        _processSubscription(creator, tierIndex, plan.duration, plan.fee, 0, "ETH");
+        _processSubscription(creator, tierIndex, plan.duration, plan.fee, address(0));
 
         // Refund excess payment
         if (msg.value > plan.fee) {
@@ -180,7 +210,13 @@ contract SubscriptionPlatform is ReentrancyGuard {
         address creator,
         uint256 tierIndex,
         address token
-    ) external notPaused validAddress(creator) validAddress(token) nonReentrant {
+    ) external 
+      notPaused 
+      validAddress(creator) 
+      validAddress(token) 
+      hasSufficientAllowance(token, creatorTiers[creator][tierIndex].tokenFee)
+      nonReentrant 
+    {
         if (!creators[creator]) revert InvalidCreator();
         if (tierIndex >= creatorTiers[creator].length) revert InvalidTierIndex();
         if (!whitelistedTokens[token]) revert TokenNotSupported();
@@ -195,13 +231,13 @@ contract SubscriptionPlatform is ReentrancyGuard {
         (uint256 creatorShare, uint256 platformFee) = _calculateFees(plan.tokenFee);
         _distributeTokenFees(creator, paymentToken, plan.tokenFee, creatorShare, platformFee);
 
-        _processSubscription(creator, tierIndex, plan.duration, 0, plan.tokenFee, "Token");
+        _processSubscription(creator, tierIndex, plan.duration, plan.tokenFee, token);
 
         emit SubscribedWithToken(msg.sender, creator, tierIndex, creatorSubscriptions[creator][msg.sender]);
     }
 
     function enableAutoRenewal(address creator) external validAddress(creator) {
-        if (creatorSubscriptions[creator][msg.sender] <= block.timestamp) revert NoActiveSubscription();
+        if (!_isSubscriptionActive(creator, msg.sender)) revert NoActiveSubscription();
         
         autoRenewal[creator][msg.sender] = true;
         emit AutoRenewalEnabled(creator, msg.sender);
@@ -214,15 +250,13 @@ contract SubscriptionPlatform is ReentrancyGuard {
 
     function suspendSubscription(address creator) external validAddress(creator) {
         if (suspendedSubscriptions[creator][msg.sender] > 0) revert AlreadySuspended();
-        if (creatorSubscriptions[creator][msg.sender] <= block.timestamp) revert NoActiveSubscription();
+        if (!_isSubscriptionActive(creator, msg.sender)) revert NoActiveSubscription();
         
         suspendedSubscriptions[creator][msg.sender] = creatorSubscriptions[creator][msg.sender];
         creatorSubscriptions[creator][msg.sender] = 0;
         
-        // Decrement active subscriber count
-        if (creatorAnalytics[creator].activeSubscribers > 0) {
-            creatorAnalytics[creator].activeSubscribers--;
-        }
+        // Remove from active subscriptions list
+        _removeActiveSubscription(msg.sender, creator);
         
         emit SubscriptionSuspended(msg.sender, creator, suspendedSubscriptions[creator][msg.sender]);
     }
@@ -233,9 +267,9 @@ contract SubscriptionPlatform is ReentrancyGuard {
         creatorSubscriptions[creator][msg.sender] = suspendedSubscriptions[creator][msg.sender];
         suspendedSubscriptions[creator][msg.sender] = 0;
         
-        // Increment active subscriber count if still valid
-        if (creatorSubscriptions[creator][msg.sender] > block.timestamp) {
-            creatorAnalytics[creator].activeSubscribers++;
+        // Add to active subscriptions list if still valid
+        if (_isSubscriptionActive(creator, msg.sender)) {
+            _addActiveSubscription(msg.sender, creator);
         }
         
         emit SubscriptionReactivated(msg.sender, creator, creatorSubscriptions[creator][msg.sender]);
@@ -254,11 +288,10 @@ contract SubscriptionPlatform is ReentrancyGuard {
         address creator,
         uint256 tierIndex,
         uint256 duration,
-        uint256 ethPaid,
-        uint256 tokensPaid,
-        string memory paymentMethod
+        uint256 amountPaid,
+        address paymentToken
     ) internal {
-        bool wasExpired = creatorSubscriptions[creator][msg.sender] <= block.timestamp;
+        bool wasExpired = !_isSubscriptionActive(creator, msg.sender);
         bool isNewSubscriber = creatorSubscriptions[creator][msg.sender] == 0;
 
         // Calculate new expiry time
@@ -271,11 +304,19 @@ contract SubscriptionPlatform is ReentrancyGuard {
         if (isNewSubscriber) {
             creatorAnalytics[creator].totalSubscribers++;
         }
-        if (wasExpired) {
-            creatorAnalytics[creator].activeSubscribers++;
-        }
+        
+        // Add to active subscriptions list
+        _addActiveSubscription(msg.sender, creator);
 
-        // Record subscription history
+        // Record subscription history (with limit)
+        if (subscriptionHistory[msg.sender].length >= MAX_HISTORY_RECORDS) {
+            // Remove the oldest record to make space
+            for (uint256 i = 0; i < subscriptionHistory[msg.sender].length - 1; i++) {
+                subscriptionHistory[msg.sender][i] = subscriptionHistory[msg.sender][i + 1];
+            }
+            subscriptionHistory[msg.sender].pop();
+        }
+        
         subscriptionHistory[msg.sender].push(
             SubscriptionRecord({
                 user: msg.sender,
@@ -283,10 +324,32 @@ contract SubscriptionPlatform is ReentrancyGuard {
                 tierIndex: tierIndex,
                 startTime: block.timestamp,
                 endTime: newExpiry,
-                amountPaid: ethPaid > 0 ? ethPaid : tokensPaid,
-                paymentMethod: paymentMethod
+                amountPaid: amountPaid,
+                paymentToken: paymentToken
             })
         );
+    }
+
+    function _addActiveSubscription(address user, address creator) internal {
+        // Check if already in the list
+        for (uint256 i = 0; i < userActiveSubscriptions[user].length; i++) {
+            if (userActiveSubscriptions[user][i] == creator) {
+                return;
+            }
+        }
+        
+        userActiveSubscriptions[user].push(creator);
+    }
+    
+    function _removeActiveSubscription(address user, address creator) internal {
+        for (uint256 i = 0; i < userActiveSubscriptions[user].length; i++) {
+            if (userActiveSubscriptions[user][i] == creator) {
+                // Swap with last element and pop
+                userActiveSubscriptions[user][i] = userActiveSubscriptions[user][userActiveSubscriptions[user].length - 1];
+                userActiveSubscriptions[user].pop();
+                return;
+            }
+        }
     }
 
     function _calculateNewExpiry(uint256 currentExpiry, uint256 duration) 
@@ -309,7 +372,7 @@ contract SubscriptionPlatform is ReentrancyGuard {
         if (!success1) revert TransferFailed();
 
         // Transfer platform fee to owner
-        (bool success2, ) = owner.call{value: platformFee}("");
+        (bool success2, ) = owner().call{value: platformFee}("");
         if (!success2) revert TransferFailed();
 
         emit FeesDistributed(creator, creatorShare, platformFee);
@@ -322,16 +385,18 @@ contract SubscriptionPlatform is ReentrancyGuard {
         uint256 creatorShare, 
         uint256 platformFee
     ) internal {
-        // Transfer from user to contract
-        token.safeTransferFrom(msg.sender, address(this), totalAmount);
+        // Transfer creator share directly from user to creator
+        token.safeTransferFrom(msg.sender, creator, creatorShare);
 
-        // Transfer creator share
-        token.safeTransfer(creator, creatorShare);
-
-        // Transfer platform fee to owner
-        token.safeTransfer(owner, platformFee);
+        // Transfer platform fee directly from user to owner
+        token.safeTransferFrom(msg.sender, owner(), platformFee);
 
         emit FeesDistributed(creator, creatorShare, platformFee);
+    }
+
+    function _isSubscriptionActive(address creator, address user) internal view returns (bool) {
+        uint256 expiry = creatorSubscriptions[creator][user];
+        return expiry > block.timestamp || (expiry + gracePeriod > block.timestamp && expiry != 0);
     }
 
     // -------------------------
@@ -399,13 +464,28 @@ contract SubscriptionPlatform is ReentrancyGuard {
     // Platform Controls
     // -------------------------
     function addWhitelistedToken(address token) external onlyOwner validAddress(token) {
-        whitelistedTokens[token] = true;
-        emit TokenWhitelisted(token);
+        if (!whitelistedTokens[token]) {
+            whitelistedTokens[token] = true;
+            allWhitelistedTokens.push(token);
+            emit TokenWhitelisted(token);
+        }
     }
 
     function removeWhitelistedToken(address token) external onlyOwner validAddress(token) {
-        whitelistedTokens[token] = false;
-        emit TokenRemovedFromWhitelist(token);
+        if (whitelistedTokens[token]) {
+            whitelistedTokens[token] = false;
+            
+            // Remove from the list
+            for (uint256 i = 0; i < allWhitelistedTokens.length; i++) {
+                if (allWhitelistedTokens[i] == token) {
+                    allWhitelistedTokens[i] = allWhitelistedTokens[allWhitelistedTokens.length - 1];
+                    allWhitelistedTokens.pop();
+                    break;
+                }
+            }
+            
+            emit TokenRemovedFromWhitelist(token);
+        }
     }
 
     function updatePlatformFee(uint256 newFeePercent) external onlyOwner {
@@ -426,10 +506,18 @@ contract SubscriptionPlatform is ReentrancyGuard {
         emit Unpaused();
     }
 
-    function transferOwnership(address newOwner) external onlyOwner validAddress(newOwner) {
-        owner = newOwner;
-        creators[newOwner] = true;
-        emit CreatorAdded(newOwner);
+    // Override Ownable2Step functions for safe ownership transfer
+    function transferOwnership(address newOwner) public override onlyOwner validAddress(newOwner) {
+        pendingOwnerOverride = newOwner;
+        emit OwnershipTransferStarted(owner(), newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwnerOverride) {
+            revert PendingOwnerOnly();
+        }
+        _transferOwnership(msg.sender);
+        pendingOwnerOverride = address(0);
     }
 
     // -------------------------
@@ -438,10 +526,10 @@ contract SubscriptionPlatform is ReentrancyGuard {
     function withdrawETH(uint256 amount) external onlyOwner {
         if (amount > address(this).balance) revert NoFundsToWithdraw();
         
-        (bool success, ) = owner.call{value: amount}("");
+        (bool success, ) = owner().call{value: amount}("");
         if (!success) revert TransferFailed();
         
-        emit ETHWithdrawn(owner, amount);
+        emit ETHWithdrawn(owner(), amount);
     }
 
     function withdrawTokens(address token, uint256 amount) external onlyOwner validAddress(token) {
@@ -449,18 +537,30 @@ contract SubscriptionPlatform is ReentrancyGuard {
         uint256 balance = tokenContract.balanceOf(address(this));
         
         if (amount > balance) revert NoFundsToWithdraw();
-        tokenContract.safeTransfer(owner, amount);
+        tokenContract.safeTransfer(owner(), amount);
         
-        emit TokensWithdrawn(token, owner, amount);
+        emit TokensWithdrawn(token, owner(), amount);
     }
 
     function emergencyWithdrawAll() external onlyOwner {
         // Withdraw all ETH
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
-            (bool success, ) = owner.call{value: ethBalance}("");
+            (bool success, ) = owner().call{value: ethBalance}("");
             if (!success) revert TransferFailed();
-            emit ETHWithdrawn(owner, ethBalance);
+            emit ETHWithdrawn(owner(), ethBalance);
+        }
+        
+        // Withdraw all whitelisted tokens
+        for (uint256 i = 0; i < allWhitelistedTokens.length; i++) {
+            address token = allWhitelistedTokens[i];
+            IERC20 tokenContract = IERC20(token);
+            uint256 tokenBalance = tokenContract.balanceOf(address(this));
+            
+            if (tokenBalance > 0) {
+                tokenContract.safeTransfer(owner(), tokenBalance);
+                emit TokensWithdrawn(token, owner(), tokenBalance);
+            }
         }
     }
 
@@ -468,7 +568,7 @@ contract SubscriptionPlatform is ReentrancyGuard {
     // View Functions
     // -------------------------
     function isSubscriptionActive(address creator, address user) external view returns (bool) {
-        return creatorSubscriptions[creator][user] > block.timestamp;
+        return _isSubscriptionActive(creator, user);
     }
 
     function getSubscriptionExpiry(address creator, address user) external view returns (uint256) {
@@ -489,30 +589,26 @@ contract SubscriptionPlatform is ReentrancyGuard {
     }
 
     function getUserActiveSubscriptions(address user) external view returns (address[] memory, uint256[] memory) {
-        // This is a simplified implementation - in production, maintain a separate mapping
-        uint256 count = 0;
+        address[] memory activeCreators = userActiveSubscriptions[user];
+        uint256[] memory expiryTimes = new uint256[](activeCreators.length);
         
-        // First pass to count active subscriptions
-        for (uint256 i = 0; i < subscriptionHistory[user].length; i++) {
-            if (subscriptionHistory[user][i].endTime > block.timestamp) {
-                count++;
-            }
-        }
-        
-        address[] memory activeCreators = new address[](count);
-        uint256[] memory expiryTimes = new uint256[](count);
-        uint256 index = 0;
-        
-        // Second pass to populate arrays
-        for (uint256 i = 0; i < subscriptionHistory[user].length; i++) {
-            if (subscriptionHistory[user][i].endTime > block.timestamp) {
-                activeCreators[index] = subscriptionHistory[user][i].creator;
-                expiryTimes[index] = subscriptionHistory[user][i].endTime;
-                index++;
-            }
+        for (uint256 i = 0; i < activeCreators.length; i++) {
+            expiryTimes[i] = creatorSubscriptions[activeCreators[i]][user];
         }
         
         return (activeCreators, expiryTimes);
+    }
+
+    function getActiveSubscriberCount(address creator) external view returns (uint32) {
+        // Calculate active subscribers on-demand for accuracy
+        uint32 count = 0;
+        for (uint256 i = 0; i < userActiveSubscriptions[msg.sender].length; i++) {
+            address user = userActiveSubscriptions[msg.sender][i];
+            if (_isSubscriptionActive(creator, user)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     function getCreatorAnalytics(address creator) external view returns (CreatorAnalytics memory) {
