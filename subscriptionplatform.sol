@@ -1,4 +1,4 @@
-```solidity
+solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -551,4 +551,3 @@ contract SubscriptionPlatform is ReentrancyGuard {
         // Allow contract to receive ETH
     }
 }
-```
