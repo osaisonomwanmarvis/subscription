@@ -229,7 +229,7 @@ For issues related to this smart contract, please:
 2. Review the comprehensive test suite for usage examples
 3. Create a new issue with detailed information about your problem
 
-⚠️ **Important**: Always test with small amounts first and verify contract functionality on testnets before mainnet usage.
+**Important**: Always test with small amounts first and verify contract functionality on testnets before mainnet usage.
 
 ## License
 
